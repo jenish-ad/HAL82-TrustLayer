@@ -14,7 +14,7 @@ except ImportError:
     from detect_crop import DocumentDetector
 
 def run_root_test():
-    IMAGE_NAME = "testimage3.jpeg" 
+    IMAGE_NAME = "testimage2.jpg" 
     MODEL_NAME = "frontbest.pt"
     CROP_OUTPUT_FOLDER = os.path.join(project_root, "detected_crops")
     
