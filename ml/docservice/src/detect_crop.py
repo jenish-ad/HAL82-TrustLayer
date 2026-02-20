@@ -90,7 +90,15 @@ class DocumentDetector:
                 class_id    = int(box.cls[0])
                 class_name  = model.names[class_id]
 
-                cropped_img  = img[y1:y2, x1:x2]
+                # In _run_detection, add slight bbox padding before cropping
+                pad = 10
+                h_img, w_img = img.shape[:2]
+                x1 = max(0, x1 - pad)
+                y1 = max(0, y1)
+                x2 = min(w_img, x2 + pad)
+                y2 = min(h_img, y2)
+
+                cropped_img = img[y1:y2, x1:x2]
                 crop_filename = f"crop_{class_name}_{i}.jpg"
                 crop_path    = os.path.join(output_dir, crop_filename)
                 cv2.imwrite(crop_path, cropped_img)
@@ -120,5 +128,8 @@ class DocumentDetector:
             output_dir,
             target_classes=None,  # detect ALL fields
         )
+    
+
+    #detect_crop.py
 
     
