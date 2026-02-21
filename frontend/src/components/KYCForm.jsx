@@ -177,6 +177,7 @@ const KYCForm = () => {
     decisionReason: "",
     finalScore: null,
   });
+  const [parsedFields, setParsedFields] = useState({});
 
   const [fullName, setFullName] = useState("");
   const [dateOfBirth, setDateOfBirth] = useState("");
@@ -332,6 +333,7 @@ const KYCForm = () => {
     setSubmitting(true);
     setVerificationStatus("");
     setVerificationDetails({ decisionReason: "", finalScore: null });
+    setParsedFields({});
 
     try {
       // the backend endpoints are yet to be defined
@@ -353,13 +355,17 @@ const KYCForm = () => {
       if (responseData?.status) {
         setVerificationStatus(responseData.status);
         setVerificationDetails({
-          decisionReason: responseData.decision_reason || "",
+          decisionReason: responseData.decision_reason || responseData.message || "",
           finalScore:
             responseData.final_score !== null &&
             responseData.final_score !== undefined
               ? Number(responseData.final_score)
               : null,
         });
+      }
+
+      if (responseData?.parsed_fields) {
+        setParsedFields(responseData.parsed_fields);
       }
 
       setFullName("");
@@ -428,9 +434,7 @@ const KYCForm = () => {
                 </div>
               ) : null}
             </div>
-          ) : null}
-
-          
+          ) : null}        
           <section>
             <h3 className="mb-4 text-lg font-medium text-slate-900">
               Personal Information
