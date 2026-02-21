@@ -1,222 +1,12 @@
-# import base64
-# import json
-# import os
-# import subprocess
-# import sys
-# from typing import Any
-# from datetime import datetime
-# from pathlib import Path
-# from uuid import uuid4
-
-# from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-# from fastapi.middleware.cors import CORSMiddleware
-
-# ROOT_DIR = Path(__file__).resolve().parents[3]
-# LIVENESS_SCRIPT = ROOT_DIR / "ml" / "liveness-service" / "liveness.py"
-# OUTPUT_DIR = ROOT_DIR / "ml" / "liveness-service" / "extracted_faces"
-# UPLOAD_DIR = ROOT_DIR / "ml" / "docservice" / "uploads"
-# CROP_OUTPUT_DIR = ROOT_DIR / "ml" / "docservice" / "crops"
-
-# DOC_SERVICE_DIR = ROOT_DIR / "ml" / "docservice"
-# if str(DOC_SERVICE_DIR) not in sys.path:
-#     sys.path.append(str(DOC_SERVICE_DIR))
-
-# FACE_SERVICE_SRC_DIR = ROOT_DIR / "ml" / "face-service" / "src"
-# if str(FACE_SERVICE_SRC_DIR) not in sys.path:
-#     sys.path.append(str(FACE_SERVICE_SRC_DIR))
-
-# from detect_crop import DocumentDetector
-# from embed import get_embedding
-# from match import compare_embeddings
-
-# app = FastAPI(title="KYC Liveness API")
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["*"],
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-
-# @app.get("/health")
-# def health_check():
-#     return {"status": "ok"}
-
-
-# detector = DocumentDetector()
-
-
-# def _save_upload(file: UploadFile, destination_dir: Path, prefix: str) -> Path:
-#     destination_dir.mkdir(parents=True, exist_ok=True)
-#     extension = Path(file.filename or "").suffix or ".jpg"
-#     destination_path = destination_dir / f"{prefix}_{uuid4().hex}{extension}"
-
-#     with destination_path.open("wb") as out_file:
-#         out_file.write(file.file.read())
-
-#     return destination_path
-
-
-# def _pick_photo_crop(detections: list[dict[str, Any]]) -> str | None:
-#     """Pick the citizenship photo crop path from detector outputs."""
-#     for detection in detections:
-#         class_name = str(detection.get("class_name", "")).lower()
-#         crop_path = detection.get("crop_path")
-#         if class_name == "photo" and crop_path:
-#             return str(crop_path)
-
-#     for detection in detections:
-#         crop_path = str(detection.get("crop_path") or "")
-#         if "photo" in Path(crop_path).stem.lower():
-#             return crop_path
-
-#     return None
-
-
-# def _latest_liveness_selfie() -> Path | None:
-#     candidate = OUTPUT_DIR / "face.jpg"
-#     return candidate if candidate.exists() else None
-
-
-# @app.post("/api/kyc/upload")
-# def upload_kyc_documents(
-#     full_name: str = Form(...),
-#     date_of_birth: str = Form(...),
-#     gender: str = Form(...),
-#     citizenship_number: str = Form(...),
-#     permanent_address: str = Form(...),
-#     current_address: str = Form(...),
-#     selfie_image: UploadFile = File(...),
-#     document_front: UploadFile = File(...),
-#     document_back: UploadFile = File(...),
-# ):
-#     del full_name, date_of_birth, gender, citizenship_number
-#     del permanent_address, current_address, selfie_image, document_back
-
-#     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-#     front_image_path = _save_upload(
-#         file=document_front,
-#         destination_dir=UPLOAD_DIR,
-#         prefix=f"front_{timestamp}",
-#     )
-
-#     crop_dir = CROP_OUTPUT_DIR / timestamp
-#     detections = detector.detect_and_crop(
-#         image_path=str(front_image_path),
-#         output_dir=str(crop_dir),
-#     )
-
-#     if not detections:
-#         raise HTTPException(
-#             status_code=400,
-#             detail="No front-side citizenship regions were detected in the uploaded image.",
-#         )
-
-#     doc_face_crop_path = _pick_photo_crop(detections)
-#     if not doc_face_crop_path:
-#         raise HTTPException(
-#             status_code=400,
-#             detail="Could not find citizenship photo crop from document detection results.",
-#         )
-
-#     liveness_selfie_path = _latest_liveness_selfie()
-#     if not liveness_selfie_path:
-#         raise HTTPException(
-#             status_code=400,
-#             detail="Live selfie image is missing. Please run active liveness first.",
-#         )
-
-#     try:
-#         emb_doc = get_embedding(doc_face_crop_path)
-#         emb_selfie = get_embedding(str(liveness_selfie_path))
-#         similarity_result = compare_embeddings(emb_doc, emb_selfie)
-#     except ValueError as exc:
-#         raise HTTPException(status_code=400, detail=str(exc)) from exc
-#     except Exception as exc:
-#         raise HTTPException(status_code=500, detail=f"Face similarity failed: {exc}") from exc
-
-#     print(
-#         "[FACE-SIMILARITY] "
-#         f"doc={doc_face_crop_path} "
-#         f"selfie={liveness_selfie_path} "
-#         f"score={similarity_result['similarity']:.6f} "
-#         f"match={similarity_result['match']}"
-#     )
-
-#     return {
-#         "status": "processed",
-#         "message": "Citizenship front image processed and crops saved.",
-#         "uploaded_front_image": str(front_image_path),
-#         "crop_directory": str(crop_dir),
-#         "detections": detections,
-#         "doc_face_crop": doc_face_crop_path,
-#         "liveness_selfie": str(liveness_selfie_path),
-#         "face_similarity": {
-#             "similarity_score": float(similarity_result["similarity"]),
-#             "match": bool(similarity_result["match"]),
-#             "threshold_used": float(similarity_result["threshold_used"]),
-#         },
-#     }
-
-
-# @app.post("/api/liveness/run")
-# def run_liveness():
-#     if not LIVENESS_SCRIPT.exists():
-#         raise HTTPException(status_code=500, detail="ml/liveness-service/liveness.py not found")
-
-#     cmd = [
-#         sys.executable,
-#         str(LIVENESS_SCRIPT),
-#         "--json",
-#         "--output-dir",
-#         str(OUTPUT_DIR),
-#     ]
-
-#     completed = subprocess.run(
-#         cmd,
-#         cwd=str(ROOT_DIR),
-#         capture_output=True,
-#         text=True,
-#         check=False,
-#     )
-
-#     stdout = completed.stdout.strip().splitlines()
-#     result_line = stdout[-1] if stdout else "{}"
-
-#     try:
-#         result = json.loads(result_line)
-#     except json.JSONDecodeError as exc:
-#         raise HTTPException(
-#             status_code=500,
-#             detail=f"Invalid liveness response: {result_line}",
-#         ) from exc
-
-#     image_path = result.get("image_path")
-#     image_data_url = None
-
-#     if image_path and os.path.exists(image_path):
-#         with open(image_path, "rb") as image_file:
-#             encoded = base64.b64encode(image_file.read()).decode("utf-8")
-#         image_data_url = f"data:image/jpeg;base64,{encoded}"
-
-#     return {
-#         "passed": bool(result.get("passed")),
-#         "message": result.get("message", "Liveness failed"),
-#         "image": image_data_url,
-#         "return_code": completed.returncode,
-#         "stderr": completed.stderr.strip(),
-#     }
-
-
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+from difflib import SequenceMatcher
 from typing import Any
 from uuid import uuid4
 
@@ -328,6 +118,92 @@ def _run_face_similarity(doc_face_crop_path: str, selfie_path: str) -> dict[str,
     }
 
 
+def _normalize_string(value: str) -> str:
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", value.lower())).strip()
+
+
+def _date_from_form(date_of_birth: str) -> tuple[str, str, str]:
+    try:
+        dt = datetime.strptime(date_of_birth, "%Y-%m-%d")
+        return str(dt.year), dt.strftime("%b").lower(), str(dt.day)
+    except ValueError:
+        return "", "", ""
+
+
+def _date_from_ocr(ocr_dob: str) -> tuple[str, str, str]:
+    year_match = re.search(r"Year:\s*(\d{4})", ocr_dob, re.IGNORECASE)
+    month_match = re.search(r"Month:\s*([A-Za-z]{3})", ocr_dob, re.IGNORECASE)
+    day_match = re.search(r"Day:\s*(\d{1,2})", ocr_dob, re.IGNORECASE)
+    return (
+        year_match.group(1) if year_match else "",
+        month_match.group(1).lower() if month_match else "",
+        day_match.group(1).lstrip("0") if day_match else "",
+    )
+
+
+def _score_similarity(expected: str, actual: str) -> float:
+    if not actual or actual in {"[NOT_DETECTED]", "[PARTIAL]", "[INVALID]"}:
+        return 0.1
+    exp = _normalize_string(expected)
+    act = _normalize_string(actual)
+    if not exp or not act:
+        return 0.1
+    return round(max(0.1, SequenceMatcher(None, exp, act).ratio()), 3)
+
+
+def _compute_field_accuracy(
+    *,
+    full_name: str,
+    date_of_birth: str,
+    citizenship_number: str,
+    permanent_address: str,
+    parsed_fields: dict[str, Any],
+) -> dict[str, Any]:
+    extracted_name = str(parsed_fields.get("full-name", {}).get("cleaned", ""))
+    extracted_citizenship = str(parsed_fields.get("citisenship-number", {}).get("cleaned", ""))
+    extracted_dob = str(parsed_fields.get("DOB", {}).get("cleaned", ""))
+    extracted_address = str(parsed_fields.get("permanent-address", {}).get("cleaned", ""))
+
+    name_accuracy = _score_similarity(full_name, extracted_name)
+    citizenship_accuracy = _score_similarity(citizenship_number, extracted_citizenship)
+
+    form_year, form_month, form_day = _date_from_form(date_of_birth)
+    ocr_year, ocr_month, ocr_day = _date_from_ocr(extracted_dob)
+    dob_parts = [
+        1.0 if form_year and form_year == ocr_year else 0.0,
+        1.0 if form_month and form_month == ocr_month else 0.0,
+        1.0 if form_day and form_day == ocr_day else 0.0,
+    ]
+    dob_accuracy = round(max(0.1, sum(dob_parts) / 3), 3)
+    if extracted_dob in {"", "[NOT_DETECTED]", "[PARTIAL]", "[INVALID]"}:
+        dob_accuracy = 0.1
+
+    address_accuracy = _score_similarity(permanent_address, extracted_address)
+    if "wardNo" in permanent_address:
+        ward_match = re.search(r'"wardNo"\s*:\s*"?(\d{1,2})', permanent_address)
+        ocr_ward_match = re.search(r"Ward\s*No:\s*(\d{1,2})", extracted_address, re.IGNORECASE)
+        if ward_match and ocr_ward_match:
+            address_accuracy = round((address_accuracy + (1.0 if ward_match.group(1) == ocr_ward_match.group(1) else 0.1)) / 2, 3)
+
+    field_accuracy = {
+        "full_name": name_accuracy,
+        "date_of_birth": dob_accuracy,
+        "citizenship_number": citizenship_accuracy,
+        "permanent_address": address_accuracy,
+    }
+    overall_accuracy = round(sum(field_accuracy.values()) / len(field_accuracy), 3)
+    return {
+        "field_accuracy": field_accuracy,
+        "overall_accuracy": overall_accuracy,
+        "extracted_values": {
+            "full_name": extracted_name,
+            "date_of_birth": extracted_dob,
+            "citizenship_number": extracted_citizenship,
+            "permanent_address": extracted_address,
+        },
+    }
+
+
 @app.post("/api/kyc/upload")
 def upload_kyc_documents(
     full_name: str = Form(...),
@@ -340,9 +216,7 @@ def upload_kyc_documents(
     document_front: UploadFile = File(...),
     document_back: UploadFile = File(...),
 ):
-    # (kept but unused in this endpoint flow)
-    del full_name, date_of_birth, gender, citizenship_number
-    del permanent_address, current_address
+    del gender, current_address
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -392,6 +266,17 @@ def upload_kyc_documents(
         output_dir=str(back_crop_dir),
     )
 
+    accuracy_report = _compute_field_accuracy(
+        full_name=full_name,
+        date_of_birth=date_of_birth,
+        citizenship_number=citizenship_number,
+        permanent_address=permanent_address,
+        parsed_fields=parsed_fields,
+    )
+
+    print("[OCR-ACCURACY] Field Accuracy:", accuracy_report["field_accuracy"])
+    print("[OCR-ACCURACY] Overall Accuracy:", accuracy_report["overall_accuracy"])
+
     doc_face_crop_path = _pick_photo_crop(front_detections)
 
     face_similarity: dict[str, Any] | None = None
@@ -432,6 +317,7 @@ def upload_kyc_documents(
         "front_detections": front_detections,
         "back_detections": back_detections,
         "parsed_fields": parsed_fields,
+        "accuracy_report": accuracy_report,
         "doc_face_crop": doc_face_crop_path,
         "face_similarity": face_similarity,
     }
