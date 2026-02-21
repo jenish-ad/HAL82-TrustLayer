@@ -10,6 +10,8 @@ from difflib import SequenceMatcher
 from typing import Any
 from uuid import uuid4
 
+import cv2
+import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -18,6 +20,7 @@ LIVENESS_SCRIPT = ROOT_DIR / "ml" / "liveness-service" / "liveness.py"
 OUTPUT_DIR = ROOT_DIR / "ml" / "liveness-service" / "extracted_faces"
 UPLOAD_DIR = ROOT_DIR / "ml" / "docservice" / "uploads"
 CROP_OUTPUT_DIR = ROOT_DIR / "ml" / "docservice" / "crops"
+STANDARD_STAMP_DIR = ROOT_DIR / "ml" / "docservice" / "standard_stamps"
 
 DOC_SERVICE_DIR = ROOT_DIR / "ml" / "docservice"
 if str(DOC_SERVICE_DIR) not in sys.path:
@@ -65,6 +68,13 @@ def health_check():
 
 detector = DocumentDetector()
 
+KYC_WEIGHTS = {
+    "face_similarity": 0.5,
+    "stamp_similarity": 0.15,
+    "ocr_accuracy": 0.35,
+}
+KYC_APPROVAL_THRESHOLD = 0.45
+
 
 def _save_upload(file: UploadFile, destination_dir: Path, prefix: str) -> Path:
     destination_dir.mkdir(parents=True, exist_ok=True)
@@ -91,6 +101,111 @@ def _pick_photo_crop(detections: list[dict[str, Any]]) -> str | None:
             return crop_path
 
     return None
+
+
+def _pick_logo_crop(detections: list[dict[str, Any]]) -> str | None:
+    """Pick the government logo/stamp crop path from detector outputs."""
+    for detection in detections:
+        class_name = str(detection.get("class_name", "")).lower()
+        crop_path = detection.get("crop_path")
+        if class_name in {"logo", "stamp", "government-stamp", "government_logo"} and crop_path:
+            return str(crop_path)
+
+    for detection in detections:
+        crop_path = str(detection.get("crop_path") or "")
+        stem = Path(crop_path).stem.lower()
+        if "logo" in stem or "stamp" in stem:
+            return crop_path
+
+    return None
+
+
+def _preprocess_stamp(image_path: str, size: tuple[int, int] = (256, 256)) -> np.ndarray:
+    image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if image is None:
+        raise ValueError(f"Unable to read stamp image: {image_path}")
+
+    resized = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+    return cv2.equalizeHist(resized)
+
+
+def _compute_stamp_similarity(
+    detected_stamp_path: str,
+    standard_stamp_dir: Path = STANDARD_STAMP_DIR,
+    threshold: float = 0.72,
+) -> dict[str, Any]:
+    """Compare a detected government stamp crop against standard stamp templates."""
+    if not Path(detected_stamp_path).exists():
+        raise ValueError(f"Detected stamp path does not exist: {detected_stamp_path}")
+
+    template_paths = sorted(
+        [
+            p
+            for p in standard_stamp_dir.glob("*")
+            if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+        ]
+    )
+    if not template_paths:
+        raise ValueError(
+            "No standard stamp templates found. "
+            f"Add template images to: {standard_stamp_dir}"
+        )
+
+    detected_img = _preprocess_stamp(detected_stamp_path)
+    orb = cv2.ORB_create(nfeatures=500)
+    detected_kp, detected_desc = orb.detectAndCompute(detected_img, None)
+
+    best_match: dict[str, Any] | None = None
+
+    for template_path in template_paths:
+        template_img = _preprocess_stamp(str(template_path))
+        template_kp, template_desc = orb.detectAndCompute(template_img, None)
+
+        orb_score = 0.0
+        if (
+            detected_desc is not None
+            and template_desc is not None
+            and len(detected_kp) >= 10
+            and len(template_kp) >= 10
+        ):
+            matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+            matches = matcher.match(detected_desc, template_desc)
+            if matches:
+                matches = sorted(matches, key=lambda m: m.distance)
+                top_matches = matches[: max(10, int(len(matches) * 0.4))]
+                avg_distance = sum(m.distance for m in top_matches) / len(top_matches)
+                orb_score = float(np.clip(1.0 - (avg_distance / 100.0), 0.0, 1.0))
+
+        template_score = float(cv2.matchTemplate(detected_img, template_img, cv2.TM_CCOEFF_NORMED)[0][0])
+        template_score = float(np.clip((template_score + 1) / 2, 0.0, 1.0))
+
+        detected_hist = cv2.calcHist([detected_img], [0], None, [64], [0, 256])
+        template_hist = cv2.calcHist([template_img], [0], None, [64], [0, 256])
+        cv2.normalize(detected_hist, detected_hist)
+        cv2.normalize(template_hist, template_hist)
+        hist_score = float(cv2.compareHist(detected_hist, template_hist, cv2.HISTCMP_CORREL))
+        hist_score = float(np.clip((hist_score + 1) / 2, 0.0, 1.0))
+
+        final_score = round((0.5 * orb_score) + (0.3 * template_score) + (0.2 * hist_score), 4)
+
+        candidate = {
+            "standard_stamp_path": str(template_path),
+            "score": final_score,
+            "orb_score": round(orb_score, 4),
+            "template_score": round(template_score, 4),
+            "hist_score": round(hist_score, 4),
+        }
+
+        if best_match is None or candidate["score"] > best_match["score"]:
+            best_match = candidate
+
+    assert best_match is not None
+    return {
+        "detected_stamp_path": detected_stamp_path,
+        "best_match": best_match,
+        "threshold_used": threshold,
+        "is_same_stamp": bool(best_match["score"] >= threshold),
+    }
 
 
 def _run_face_similarity(doc_face_crop_path: str, selfie_path: str) -> dict[str, Any] | None:
@@ -204,6 +319,50 @@ def _compute_field_accuracy(
     }
 
 
+def _safe_score(value: Any) -> float:
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, score))
+
+
+def _compute_kyc_decision(
+    accuracy_report: dict[str, Any],
+    face_similarity: dict[str, Any] | None,
+    stamp_similarity: dict[str, Any] | None,
+) -> dict[str, Any]:
+    face_score = _safe_score((face_similarity or {}).get("similarity"))
+    stamp_score = _safe_score(((stamp_similarity or {}).get("best_match") or {}).get("score"))
+    ocr_score = _safe_score((accuracy_report or {}).get("overall_accuracy"))
+
+    weighted_score = round(
+        (face_score * KYC_WEIGHTS["face_similarity"])
+        + (stamp_score * KYC_WEIGHTS["stamp_similarity"])
+        + (ocr_score * KYC_WEIGHTS["ocr_accuracy"]),
+        4,
+    )
+
+    approved = weighted_score >= KYC_APPROVAL_THRESHOLD
+    status = "approved" if approved else "rejected"
+    return {
+        "status": status,
+        "approved": approved,
+        "overall_score": weighted_score,
+        "threshold": KYC_APPROVAL_THRESHOLD,
+        "weights": KYC_WEIGHTS,
+        "component_scores": {
+            "face_similarity": face_score,
+            "stamp_similarity": stamp_score,
+            "ocr_accuracy": ocr_score,
+        },
+        "decision_reason": (
+            f"KYC {status.upper()} "
+            f"{'≥' if approved else '<'} threshold {KYC_APPROVAL_THRESHOLD:.2f})"
+        ),
+    }
+
+
 @app.post("/api/kyc/upload")
 def upload_kyc_documents(
     full_name: str = Form(...),
@@ -278,6 +437,7 @@ def upload_kyc_documents(
     print("[OCR-ACCURACY] Overall Accuracy:", accuracy_report["overall_accuracy"])
 
     doc_face_crop_path = _pick_photo_crop(front_detections)
+    doc_logo_crop_path = _pick_logo_crop(front_detections)
 
     face_similarity: dict[str, Any] | None = None
     if doc_face_crop_path:
@@ -290,6 +450,17 @@ def upload_kyc_documents(
             face_similarity = {"error": f"Face similarity failed: {exc}"}
     else:
         face_similarity = {"error": "No citizenship photo crop found in front detections."}
+
+    stamp_similarity: dict[str, Any] | None = None
+    if doc_logo_crop_path:
+        try:
+            stamp_similarity = _compute_stamp_similarity(doc_logo_crop_path)
+        except ValueError as exc:
+            stamp_similarity = {"error": str(exc)}
+        except Exception as exc:
+            stamp_similarity = {"error": f"Stamp similarity failed: {exc}"}
+    else:
+        stamp_similarity = {"error": "No government logo/stamp crop found in front detections."}
 
     # ✅ SAFE TERMINAL LOGGING (won't crash)
     if face_similarity is None:
@@ -306,8 +477,34 @@ def upload_kyc_documents(
             f"threshold={face_similarity['threshold_used']}"
         )
 
+    if stamp_similarity is None:
+        print("[STAMP-SIMILARITY] Skipped.")
+    elif isinstance(stamp_similarity, dict) and "error" in stamp_similarity:
+        print(f"[STAMP-SIMILARITY] Failed: {stamp_similarity['error']}")
+    else:
+        print(
+            "[STAMP-SIMILARITY] "
+            f"detected={doc_logo_crop_path} "
+            f"matched={stamp_similarity['best_match']['standard_stamp_path']} "
+            f"score={stamp_similarity['best_match']['score']:.4f} "
+            f"same={stamp_similarity['is_same_stamp']} "
+            f"threshold={stamp_similarity['threshold_used']}"
+        )
+
+    kyc_decision = _compute_kyc_decision(
+        accuracy_report=accuracy_report,
+        face_similarity=face_similarity,
+        stamp_similarity=stamp_similarity,
+    )
+
     return {
-        "status": "processed",
+        "status": kyc_decision["status"],
+        "approved": kyc_decision["approved"],
+        "final_score": kyc_decision["overall_score"],
+        "overall_threshold": kyc_decision["threshold"],
+        "weights": kyc_decision["weights"],
+        "component_scores": kyc_decision["component_scores"],
+        "decision_reason": kyc_decision["decision_reason"],
         "message": "Citizenship front/back processed and OCR extracted.",
         "uploaded_front_image": str(front_image_path),
         "uploaded_back_image": str(back_image_path),
@@ -319,7 +516,9 @@ def upload_kyc_documents(
         "parsed_fields": parsed_fields,
         "accuracy_report": accuracy_report,
         "doc_face_crop": doc_face_crop_path,
+        "doc_logo_crop": doc_logo_crop_path,
         "face_similarity": face_similarity,
+        "stamp_similarity": stamp_similarity,
     }
 
 

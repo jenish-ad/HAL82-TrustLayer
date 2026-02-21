@@ -416,11 +416,16 @@ const KYCForm = () => {
           ) : null}
 
           {verificationStatus ? (
-            <div className="rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-700">
-              <span className="font-semibold text-slate-900">
-                Verification Status:
-              </span>{" "}
-              {verificationStatus}
+            <div
+              className={`rounded-xl px-4 py-3 text-sm ${
+                verificationStatus === "approved"
+                  ? "border border-emerald-200 bg-emerald-50 text-emerald-700"
+                  : "border border-red-200 bg-red-50 text-red-700"
+              }`}
+            >
+              <span className="font-semibold">
+                KYC {verificationStatus === "approved" ? "Approved" : "Not Approved"}
+              </span>
 
               {verificationDetails.decisionReason ? (
                 <div className="mt-2 text-slate-600">
